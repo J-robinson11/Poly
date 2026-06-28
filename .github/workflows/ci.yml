@@ -33,7 +33,7 @@ jobs:
 
           # 1. The module imports cleanly and key functions exist.
           for fn in ("clean_markets", "parse_json_block", "build_discord_payload",
-                     "build_sms", "log_bets"):
+                     "send_alert", "log_bets"):
               assert hasattr(vs, fn), f"missing function: {fn}"
 
           # 2. JSON parsing handles a fenced block like the model returns.
