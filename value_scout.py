@@ -56,7 +56,7 @@ USER_AGENT = "polymarket-value-scout/1.0"
 # ---------------------------------------------------------------------------
 # 1. Pull + clean Polymarket data
 # ---------------------------------------------------------------------------
-def fetch_events(tag_slug: str, limit: int = 12) -> list:
+def fetch_events(tag_slug: str, limit: int = 30) -> list:
     """Fetch open events for a tag, newest-volume first, from the Gamma API."""
     params = {
         "closed": "false",
@@ -120,8 +120,10 @@ def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list
                 }
             )
     # Most active first; cap the list so the model stays focused + costs stay low.
+    # Tunable via MARKET_CAP env var (default 40).
     cleaned.sort(key=lambda x: x["volume24hr"], reverse=True)
-    return cleaned[:25]
+    cap = int(os.environ.get("MARKET_CAP", "40"))
+    return cleaned[:cap]
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +158,20 @@ For BOTH methods:
 - Search recent news to confirm nothing has changed (injuries, suspensions,
   results) that would explain or invalidate the edge.
 - Compute edge_pp = (your_fair_prob - polymarket_ask) * 100.
-- Flag ONLY if edge_pp >= {min_edge_pp} and you have solid reasoning.
-- Assign confidence High/Medium/Low. Be conservative — zero flags is fine.
-- Never invent an edge. Rank flagged bets by edge_pp, highest first.
+- Flag any outcome with edge_pp >= {min_edge_pp}. Use the confidence field to
+  communicate how strong it is — do NOT silently discard a real numerical edge
+  just because sportsbooks roughly agree; instead flag it as Low confidence and
+  explain the risk in case_against. The user wants to SEE the candidates and
+  decide; your job is to surface and grade them, not to gatekeep to zero.
+- Confidence guide:
+    High   = strong edge, sources agree, news is clean, liquid market.
+    Medium = decent edge with a solid thesis but some uncertainty.
+    Low    = a real {min_edge_pp}pp+ edge exists but it's speculative (books
+             roughly agree, thin liquidity, or news is murky). Still flag it.
+- Aim to surface roughly the 2-4 best opportunities per run when they exist,
+  ranked by edge_pp (highest first). It is fine to return more or fewer.
+- Never INVENT an edge or fabricate numbers — if the math doesn't show
+  {min_edge_pp}pp, it doesn't get flagged. Honesty over hitting a count.
 
 After your research, output your final answer as a single fenced JSON block and
 NOTHING after it, in exactly this schema:
@@ -406,9 +419,9 @@ def send_alert(result: dict) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     tag = os.environ.get("MARKET_TAG", "world-cup")
-    min_edge_pp = float(os.environ.get("MIN_EDGE_PP", "4"))
-    min_liquidity = float(os.environ.get("MIN_LIQUIDITY", "2000"))
-    max_spread = float(os.environ.get("MAX_SPREAD", "0.04"))
+    min_edge_pp = float(os.environ.get("MIN_EDGE_PP", "3"))
+    min_liquidity = float(os.environ.get("MIN_LIQUIDITY", "1000"))
+    max_spread = float(os.environ.get("MAX_SPREAD", "0.06"))
     model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     dry_run = os.environ.get("DRY_RUN") == "1"
 
