@@ -51,8 +51,43 @@ jobs:
         if: failure()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TRIGGER: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl -sf -H "Content-Type: application/json" \
-            -d "{\"username\":\"Poly\",\"embeds\":[{\"title\":\"⚠️ Poly run FAILED\",\"description\":\"The Poly job failed. Check the logs and fix.\\n\\n[View run logs]($RUN_URL)\",\"color\":15158332}]}" \
-            "$DISCORD_WEBHOOK_URL"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          NOW_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          # First commit subject line only, JSON-escaped for safety.
+          COMMIT_LINE="$(printf '%s' "$COMMIT_MSG" | head -n1)"
+          # Build the payload with jq so all fields are safely escaped.
+          jq -n \
+            --arg run_url "$RUN_URL" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg attempt "$RUN_ATTEMPT" \
+            --arg trigger "$TRIGGER" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg sha "$SHORT_SHA" \
+            --arg commit "$COMMIT_LINE" \
+            --arg now "$NOW_UTC" \
+            '{
+              username: "Poly",
+              embeds: [{
+                title: "⚠️ Poly run FAILED",
+                description: ("The scheduled Poly job did not complete. No alert was sent this run — check the logs and fix.\n\n**[➡ Open the run logs](" + $run_url + ")**"),
+                color: 15158332,
+                fields: [
+                  {name: "Repository", value: $repo, inline: true},
+                  {name: "Run #",      value: ("`" + $run_id + "`  (attempt " + $attempt + ")"), inline: true},
+                  {name: "Triggered by", value: $trigger, inline: true},
+                  {name: "Branch",     value: $branch, inline: true},
+                  {name: "Commit",     value: ("`" + $sha + "`"), inline: true},
+                  {name: "Failed at",  value: $now, inline: true},
+                  {name: "Latest commit", value: (if $commit == "" then "n/a" else $commit end), inline: false},
+                  {name: "Likely causes", value: "• Anthropic API error or out of credit\n• Polymarket API/network hiccup\n• Model output could not be parsed as JSON", inline: false}
+                ],
+                footer: {text: "Poly · automated failure alert"}
+              }]
+            }' \
+          | curl -sf -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
