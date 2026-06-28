@@ -181,6 +181,9 @@ NOTHING after it, in exactly this schema:
 }}
 ```
 If nothing qualifies, return "flagged": [] (still include near_misses + summary).
+
+IMPORTANT: Keep your reasoning concise. End your response with the JSON block and
+absolutely nothing after it. The JSON block MUST appear or the run fails.
 """
 
 
@@ -195,9 +198,9 @@ def run_analysis(client: Anthropic, model: str, markets: list, min_edge_pp: floa
 
     resp = client.messages.create(
         model=model,
-        max_tokens=4000,
+        max_tokens=8000,
         system=system,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 12}],
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 16}],
         messages=[{"role": "user", "content": user}],
     )
 
