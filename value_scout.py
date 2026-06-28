@@ -237,8 +237,9 @@ def parse_json_block(text: str) -> dict:
 # ---------------------------------------------------------------------------
 def build_sms(result: dict) -> str:
     flagged = result.get("flagged", [])
+    summary = result.get("summary", "No summary.")
     if not flagged:
-        return ""  # silence on no signal
+        return f"Poly Scout: No qualifying bets this run. {summary}"
     top = flagged[0]
     extra = f" (+{len(flagged) - 1} more)" if len(flagged) > 1 else ""
     msg = (
@@ -248,7 +249,7 @@ def build_sms(result: dict) -> str:
         f"{top['confidence']} conf){extra}. "
         f"Confirm price in your Polymarket US app. Not financial advice."
     )
-    return msg[:600]  # keep it to a few SMS segments
+    return msg[:600]
 
 
 def send_alert(body: str) -> None:
@@ -330,10 +331,6 @@ def main() -> int:
     print(json.dumps(result, indent=2))
 
     body = build_sms(result)
-    if not body:
-        print("No qualifying edge — staying silent (no SMS).")
-        return 0
-
     if dry_run:
         print("DRY_RUN=1, would have alerted:\n" + body)
     else:
