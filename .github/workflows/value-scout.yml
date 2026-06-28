@@ -2,12 +2,15 @@ name: Poly
 
 # Runs the scan 3x/day in the cloud — no local machine needed.
 # NOTE: GitHub Actions cron is in UTC and does NOT observe Daylight Saving.
-# Times below are set for US Central during the 2026 World Cup (CDT = UTC-5):
-#   7:30 AM CT = 12:30 UTC | 12:30 PM CT = 17:30 UTC | 5:30 PM CT = 22:30 UTC
-# If you're in another timezone, or after DST changes, adjust the hours.
+# GitHub's free scheduler typically fires ~1 hour LATE under load, so these
+# times are intentionally set ~1h10m EARLIER than the target delivery time and
+# off the top of the hour (:20) to reduce congestion/drift.
+# Nominal fire (UTC) -> expected delivery (CDT = UTC-5, ~1h drift):
+#   11:20 UTC -> ~7:20 AM CT | 16:20 UTC -> ~12:20 PM CT | 21:20 UTC -> ~5:20 PM CT
+# If drift changes, nudge the hours/minutes here.
 on:
   schedule:
-    - cron: "30 12,17,22 * * *"
+    - cron: "20 11,16,21 * * *"
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 jobs:
