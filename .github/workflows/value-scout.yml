@@ -14,6 +14,8 @@ jobs:
   scout:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Check out repo
         uses: actions/checkout@v4

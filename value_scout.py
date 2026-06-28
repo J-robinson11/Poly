@@ -236,36 +236,99 @@ def parse_json_block(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. Alert to your phone (free: Discord webhook or ntfy.sh; or paid Twilio SMS)
+# 3. Bet tracking — append flagged bets to bets_log.jsonl in the repo
 # ---------------------------------------------------------------------------
-def build_sms(result: dict) -> str:
+def log_bets(result: dict, run_at: str) -> None:
+    log_path = os.path.join(os.path.dirname(__file__), "bets_log.jsonl")
     flagged = result.get("flagged", [])
-    summary = result.get("summary", "No summary.")
     if not flagged:
-        return f"Poly Scout: No qualifying bets this run. {summary}"
-    top = flagged[0]
-    extra = f" (+{len(flagged) - 1} more)" if len(flagged) > 1 else ""
-    msg = (
-        f"Poly value alert: {top['outcome']} — "
-        f"{top['market']}. Poly {round(top['polymarket_ask_pct'])}% vs fair "
-        f"{round(top['fair_pct'])}% (+{round(top['edge_pp'], 1)}pp, "
-        f"{top['confidence']} conf){extra}. "
-        f"Confirm price in your Polymarket US app. Not financial advice."
-    )
-    return msg[:600]
+        return
+    with open(log_path, "a") as f:
+        for bet in flagged:
+            record = {"run_at": run_at, **bet}
+            f.write(json.dumps(record) + "\n")
+    print(f"Logged {len(flagged)} bet(s) to bets_log.jsonl")
 
 
-def send_alert(body: str) -> None:
+def commit_log() -> None:
+    """Commit bets_log.jsonl back to the repo so it persists across runs."""
+    repo = os.path.join(os.path.dirname(__file__))
+    os.system(f'cd "{repo}" && git config user.email "scout@poly" && git config user.name "Poly Scout"')
+    os.system(f'cd "{repo}" && git add bets_log.jsonl && git diff --cached --quiet || git commit -m "chore: log flagged bets"')
+    os.system(f'cd "{repo}" && git push')
+
+
+# ---------------------------------------------------------------------------
+# 4. Discord embed alert
+# ---------------------------------------------------------------------------
+CONF_COLOR = {"High": 0x2ECC71, "Medium": 0xF1C40F, "Low": 0xE67E22}  # green / yellow / orange
+
+
+def build_discord_payload(result: dict) -> dict:
+    flagged = result.get("flagged", [])
+    summary = result.get("summary", "No qualifying bets this run.")
+
+    if not flagged:
+        return {
+            "username": "Poly Scout",
+            "embeds": [{
+                "title": "No value bets found",
+                "description": summary,
+                "color": 0x95A5A6,
+            }],
+        }
+
+    embeds = []
+    for bet in flagged:
+        conf = bet.get("confidence", "Low")
+        color = CONF_COLOR.get(conf, 0x95A5A6)
+        poly_pct = round(bet.get("polymarket_ask_pct", 0))
+        fair_pct = round(bet.get("fair_pct", 0))
+        edge = round(bet.get("edge_pp", 0), 1)
+        embeds.append({
+            "title": f"VALUE BET: {bet.get('outcome')}",
+            "description": bet.get("market", ""),
+            "color": color,
+            "fields": [
+                {"name": "Polymarket", "value": f"{poly_pct}%", "inline": True},
+                {"name": "Fair value", "value": f"{fair_pct}%", "inline": True},
+                {"name": "Edge", "value": f"+{edge}pp", "inline": True},
+                {"name": "Confidence", "value": conf, "inline": True},
+                {"name": "Case for", "value": bet.get("case_for", ""), "inline": False},
+                {"name": "Risk", "value": bet.get("case_against", ""), "inline": False},
+            ],
+            "footer": {"text": "Confirm price in Polymarket US app. Not financial advice."},
+        })
+
+    if len(embeds) > 1:
+        embeds[0]["description"] += f"\n\n*+{len(embeds) - 1} more bet(s) below*"
+
+    return {"username": "Poly Scout", "embeds": embeds[:10]}  # Discord max 10 embeds
+
+
+def send_alert(result: dict) -> None:
     """Send the alert via whichever channel is configured (free options first)."""
     if os.environ.get("DISCORD_WEBHOOK_URL"):
-        r = requests.post(
-            os.environ["DISCORD_WEBHOOK_URL"],
-            json={"content": body, "username": "Poly"},
-            timeout=30,
-        )
+        payload = build_discord_payload(result)
+        r = requests.post(os.environ["DISCORD_WEBHOOK_URL"], json=payload, timeout=30)
         r.raise_for_status()
         print("Alert sent via Discord webhook.")
         return
+
+    # Fallback: plain-text channels
+    flagged = result.get("flagged", [])
+    summary = result.get("summary", "")
+    if not flagged:
+        body = f"Poly Scout: No qualifying bets this run. {summary}"
+    else:
+        top = flagged[0]
+        extra = f" (+{len(flagged) - 1} more)" if len(flagged) > 1 else ""
+        body = (
+            f"Poly value alert: {top['outcome']} — {top['market']}. "
+            f"Poly {round(top['polymarket_ask_pct'])}% vs fair {round(top['fair_pct'])}% "
+            f"(+{round(top['edge_pp'], 1)}pp, {top['confidence']} conf){extra}. "
+            f"Confirm price in your Polymarket US app. Not financial advice."
+        )[:600]
 
     if os.environ.get("NTFY_TOPIC"):
         server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -285,11 +348,7 @@ def send_alert(body: str) -> None:
         url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
         r = requests.post(
             url,
-            data={
-                "From": os.environ["TWILIO_FROM"],
-                "To": os.environ["ALERT_TO_PHONE"],
-                "Body": body,
-            },
+            data={"From": os.environ["TWILIO_FROM"], "To": os.environ["ALERT_TO_PHONE"], "Body": body},
             auth=(sid, token),
             timeout=30,
         )
@@ -333,11 +392,14 @@ def main() -> int:
     print(f"Flagged bets: {len(flagged)}")
     print(json.dumps(result, indent=2))
 
-    body = build_sms(result)
+    log_bets(result, now)
+    commit_log()
+
     if dry_run:
-        print("DRY_RUN=1, would have alerted:\n" + body)
+        print("DRY_RUN=1, would have alerted:")
+        print(json.dumps(build_discord_payload(result), indent=2))
     else:
-        send_alert(body)
+        send_alert(result)
     return 0
 
 
