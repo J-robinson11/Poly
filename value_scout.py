@@ -251,11 +251,20 @@ def log_bets(result: dict, run_at: str) -> None:
 
 
 def commit_log() -> None:
-    """Commit bets_log.jsonl back to the repo so it persists across runs."""
-    repo = os.path.join(os.path.dirname(__file__))
+    """Commit bets_log.jsonl back to the repo so it persists across runs.
+
+    No-op when no log file exists yet (i.e. no bet has ever been flagged),
+    which avoids the harmless-but-noisy 'pathspec did not match' git error.
+    """
+    repo = os.path.dirname(__file__)
+    log_path = os.path.join(repo, "bets_log.jsonl")
+    if not os.path.exists(log_path):
+        return
     os.system(f'cd "{repo}" && git config user.email "scout@poly" && git config user.name "Poly"')
-    os.system(f'cd "{repo}" && git add bets_log.jsonl && git diff --cached --quiet || git commit -m "chore: log flagged bets"')
-    os.system(f'cd "{repo}" && git push')
+    os.system(
+        f'cd "{repo}" && git add bets_log.jsonl '
+        f'&& (git diff --cached --quiet || (git commit -m "chore: log flagged bets" && git push))'
+    )
 
 
 # ---------------------------------------------------------------------------
