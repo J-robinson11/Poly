@@ -2,12 +2,12 @@ name: Polymarket Value Scout
 
 # Runs the scan 3x/day in the cloud — no local machine needed.
 # NOTE: GitHub Actions cron is in UTC and does NOT observe Daylight Saving.
-# Times below are set for US Eastern during the 2026 World Cup (EDT = UTC-4):
-#   7:30 AM ET = 11:30 UTC | 12:30 PM ET = 16:30 UTC | 5:30 PM ET = 21:30 UTC
+# Times below are set for US Central during the 2026 World Cup (CDT = UTC-5):
+#   7:30 AM CT = 12:30 UTC | 12:30 PM CT = 17:30 UTC | 5:30 PM CT = 22:30 UTC
 # If you're in another timezone, or after DST changes, adjust the hours.
 on:
   schedule:
-    - cron: "30 11,16,21 * * *"
+    - cron: "30 12,17,22 * * *"
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 jobs:
