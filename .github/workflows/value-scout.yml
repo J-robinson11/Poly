@@ -45,3 +45,14 @@ jobs:
           # MARKET_TAG: world-cup
           # MIN_EDGE_PP: "4"
         run: python value_scout.py
+
+      # Notify Discord if any step above failed, so you know to check the logs.
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -sf -H "Content-Type: application/json" \
+            -d "{\"username\":\"Poly Scout\",\"embeds\":[{\"title\":\"⚠️ Scout run FAILED\",\"description\":\"The Polymarket Value Scout job failed. Check the logs and fix.\\n\\n[View run logs]($RUN_URL)\",\"color\":15158332}]}" \
+            "$DISCORD_WEBHOOK_URL"
