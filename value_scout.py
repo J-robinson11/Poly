@@ -285,17 +285,20 @@ def build_discord_payload(result: dict) -> dict:
         poly_pct = round(bet.get("polymarket_ask_pct", 0))
         fair_pct = round(bet.get("fair_pct", 0))
         edge = round(bet.get("edge_pp", 0), 1)
+        # Discord rejects empty field values and truncates at 1024 chars.
+        case_for = (bet.get("case_for") or "n/a")[:1024]
+        case_against = (bet.get("case_against") or "n/a")[:1024]
         embeds.append({
-            "title": f"VALUE BET: {bet.get('outcome')}",
-            "description": bet.get("market", ""),
+            "title": f"VALUE BET: {bet.get('outcome')}"[:256],
+            "description": (bet.get("market") or "")[:4096],
             "color": color,
             "fields": [
                 {"name": "Polymarket", "value": f"{poly_pct}%", "inline": True},
                 {"name": "Fair value", "value": f"{fair_pct}%", "inline": True},
                 {"name": "Edge", "value": f"+{edge}pp", "inline": True},
                 {"name": "Confidence", "value": conf, "inline": True},
-                {"name": "Case for", "value": bet.get("case_for", ""), "inline": False},
-                {"name": "Risk", "value": bet.get("case_against", ""), "inline": False},
+                {"name": "Case for", "value": case_for, "inline": False},
+                {"name": "Risk", "value": case_against, "inline": False},
             ],
             "footer": {"text": "Confirm price in Polymarket US app. Not financial advice."},
         })
