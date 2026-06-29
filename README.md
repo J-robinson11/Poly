@@ -111,8 +111,8 @@ Set as repo secrets or edit the `env:` block in `moby.yml`:
 
 | Variable | Default | What it does |
 |----------|---------|--------------|
-| `MARKET_TAG` | `world-cup` | Which Polymarket tag to scan |
-| `MARKET_CAP` | `40` | Markets analyzed per run |
+| `MARKET_TAG` | `fifa-world-cup` | Which Polymarket tag to scan (this tag includes the live per-match markets **and** futures; the bare `world-cup` tag has only tournament-level futures) |
+| `MARKET_CAP` | `50` | Markets analyzed per run |
 | `FUTURES_SLOTS` | `6` | Slots reserved for futures vs props |
 | `MIN_SMART_MONEY_USD` | `2000` | Skip markets with little big-money interest |
 | `MIN_LIQUIDITY` / `MAX_SPREAD` | `500` / `0.07` | Quality filters on markets |

@@ -30,8 +30,8 @@ Twilio:
 
 Optional:
   ANTHROPIC_MODEL       - default "claude-haiku-4-5-20251001"
-  MARKET_TAG            - default "world-cup"
-  MARKET_CAP            - default 40 (markets analyzed per run)
+  MARKET_TAG            - default "fifa-world-cup" (incl. live match markets)
+  MARKET_CAP            - default 50 (markets analyzed per run)
   FUTURES_SLOTS         - default 6 (slots reserved for futures markets)
   MIN_LIQUIDITY         - default 500
   MAX_SPREAD            - default 0.07
@@ -107,30 +107,47 @@ def _parse_ts(*candidates) -> float:
 
 
 # Keyword hints for classifying a market by type. Lower number = scanned first.
-_PLAYER_HINTS = (
-    "to score", "goal scorer", "golden boot", "top scorer", "hat trick",
-    "assist", "player", "to score a goal", "anytime", "first goal",
+# Specific single-match market phrases — win first so e.g. "both teams to score"
+# isn't miscaught by the broad "to score" player hint.
+_GAME_STRONG = (
+    "both teams to score", "btts", "total goals", "total corners", "corners",
+    "over ", "under ", "exact score", "correct score", "halftime", "half-time",
+    "1st half", "first half", "second half", "clean sheet", "first team to score",
+    "to win the match", "end in a draw", "double chance", "handicap",
+    "to score first", "winning margin", "anytime team",
 )
-_GAME_HINTS = (
-    " vs ", " vs.", " v ", "both teams to score", "btts", "total goals",
-    "over ", "under ", "draw", "clean sheet", "to win the match",
-    "halftime", "1st half", "first half", "correct score", "match",
+# Player-prop signals — checked against question AND event (events are titled
+# e.g. "Brazil vs. Japan - Player Props").
+_PLAYER_HINTS = (
+    "to score", "goalscorer", "goal scorer", "golden boot", "top scorer",
+    "hat trick", "hat-trick", "assist", "player prop", "anytime scorer",
+    "first goal", "to be carded", "to be booked", "shots on target",
+    "player to", " goals", "brace",
 )
 _FUTURE_HINTS = (
     "win the world cup", "to win the tournament", "champion", "winner",
     "to reach", "reach the", "advance", "quarterfinal", "semifinal",
-    "semi-final", "quarter-final", "to make the final", "win group",
-    "group winner", "to qualify", "round of 16", "round of 32",
+    "semi-final", "quarter-final", "to make the final", "reach final",
+    "win group", "group winner", "to qualify", "round of 16", "round of 32",
+    "golden glove", "golden ball", "furthest advancing",
 )
 
 
 def classify_market(question: str, event: str) -> tuple:
-    """Return (priority, label). Game hints checked before player hints."""
-    text = f"{question} {event}".lower()
-    if any(h in text for h in _GAME_HINTS):
+    """Return (priority, label). Lower priority is scanned/ranked first.
+
+    Order: specific match-market phrase -> player signal -> bare 'X vs Y'
+    moneyline -> tournament/futures -> other.
+    """
+    q = question.lower()
+    ev = event.lower()
+    text = f"{q} {ev}"
+    if any(h in text for h in _GAME_STRONG):
         return (0, "game_prop")
     if any(h in text for h in _PLAYER_HINTS):
         return (1, "player_prop")
+    if " vs " in ev or " vs." in ev or " v " in ev or " vs " in q:
+        return (0, "game_prop")  # bare match moneyline / per-match market
     if any(h in text for h in _FUTURE_HINTS):
         return (2, "future")
     return (3, "other")
@@ -178,7 +195,7 @@ def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list
                 }
             )
 
-    cap = int(os.environ.get("MARKET_CAP", "40"))
+    cap = int(os.environ.get("MARKET_CAP", "50"))
     futures_slots = int(os.environ.get("FUTURES_SLOTS", "6"))
     futures_slots = max(0, min(futures_slots, cap))
 
@@ -831,7 +848,7 @@ def send_alert(result: dict) -> None:
 # main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    tag = os.environ.get("MARKET_TAG", "world-cup")
+    tag = os.environ.get("MARKET_TAG", "fifa-world-cup")
     min_liquidity = float(os.environ.get("MIN_LIQUIDITY", "500"))
     max_spread = float(os.environ.get("MAX_SPREAD", "0.07"))
     min_smart_usd = float(os.environ.get("MIN_SMART_MONEY_USD", "2000"))
