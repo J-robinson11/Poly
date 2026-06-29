@@ -1,20 +1,19 @@
-name: Poly
+name: Moby
 
-# Runs the scan 3x/day in the cloud — no local machine needed.
+# Runs the smart-money scan 3x/day in the cloud — no local machine needed.
 # NOTE: GitHub Actions cron is in UTC and does NOT observe Daylight Saving.
 # GitHub's free scheduler typically fires ~1 hour LATE under load, so these
 # times are intentionally set ~1h10m EARLIER than the target delivery time and
 # off the top of the hour (:20) to reduce congestion/drift.
 # Nominal fire (UTC) -> expected delivery (CDT = UTC-5, ~1h drift):
 #   11:20 UTC -> ~7:20 AM CT | 16:20 UTC -> ~12:20 PM CT | 21:20 UTC -> ~5:20 PM CT
-# If drift changes, nudge the hours/minutes here.
 on:
   schedule:
     - cron: "20 11,16,21 * * *"
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 jobs:
-  scout:
+  moby:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -31,14 +30,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Poly
+      - name: Run Moby
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # --- Alert channel: set ONE. Discord (free) is the default. ---
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # Or use ntfy.sh (free, no signup) instead of Discord:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          # Or paid SMS via Twilio:
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
           TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
@@ -46,8 +43,9 @@ jobs:
           # Optional overrides (uncomment to change):
           # ANTHROPIC_MODEL: claude-sonnet-4-6
           # MARKET_TAG: world-cup
-          # MIN_EDGE_PP: "4"
-        run: python value_scout.py
+          # MARKET_CAP: "40"
+          # MIN_SMART_MONEY_USD: "2000"
+        run: python moby.py
 
       # Notify Discord if any step above failed, so you know to check the logs.
       - name: Notify Discord on failure
@@ -61,9 +59,7 @@ jobs:
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           SHORT_SHA="${GITHUB_SHA:0:7}"
           NOW_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
-          # First commit subject line only, JSON-escaped for safety.
           COMMIT_LINE="$(printf '%s' "$COMMIT_MSG" | head -n1)"
-          # Build the payload with jq so all fields are safely escaped.
           jq -n \
             --arg run_url "$RUN_URL" \
             --arg repo "$GITHUB_REPOSITORY" \
@@ -75,10 +71,10 @@ jobs:
             --arg commit "$COMMIT_LINE" \
             --arg now "$NOW_UTC" \
             '{
-              username: "Poly",
+              username: "Moby",
               embeds: [{
-                title: "⚠️ Poly run FAILED",
-                description: ("The scheduled Poly job did not complete. No alert was sent this run — check the logs and fix.\n\n**[➡ Open the run logs](" + $run_url + ")**"),
+                title: "⚠️ Moby run FAILED",
+                description: ("The scheduled Moby job did not complete. No alert was sent this run — check the logs and fix.\n\n**[➡ Open the run logs](" + $run_url + ")**"),
                 color: 15158332,
                 fields: [
                   {name: "Repository", value: $repo, inline: true},
@@ -88,9 +84,9 @@ jobs:
                   {name: "Commit",     value: ("`" + $sha + "`"), inline: true},
                   {name: "Failed at",  value: $now, inline: true},
                   {name: "Latest commit", value: (if $commit == "" then "n/a" else $commit end), inline: false},
-                  {name: "Likely causes", value: "• Anthropic API error or out of credit\n• Polymarket API/network hiccup\n• Model output could not be parsed as JSON", inline: false}
+                  {name: "Likely causes", value: "• Anthropic API error or out of credit\n• Polymarket Gamma/Data API hiccup\n• Model output could not be parsed as JSON", inline: false}
                 ],
-                footer: {text: "Poly · automated failure alert"}
+                footer: {text: "Moby · automated failure alert"}
               }]
             }' \
           | curl -sf -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"

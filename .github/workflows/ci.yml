@@ -23,62 +23,75 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Compile-check the script
-        run: python -m py_compile value_scout.py
+        run: python -m py_compile moby.py
 
       - name: Import + smoke-test (no network, no API calls)
         run: |
           python - <<'PY'
-          import json
-          import value_scout as vs
+          import moby
 
           # 1. The module imports cleanly and key functions exist.
-          for fn in ("clean_markets", "parse_json_block", "build_discord_payload",
-                     "send_alert", "log_bets"):
-              assert hasattr(vs, fn), f"missing function: {fn}"
+          for fn in ("clean_markets", "summarize_holders", "parse_json_block",
+                     "build_discord_payload", "send_alert", "log_signals"):
+              assert hasattr(moby, fn), f"missing function: {fn}"
 
-          # 2. JSON parsing handles a fenced block like the model returns.
-          sample = '''Here is my analysis.
+          # 2. Market classification works.
+          assert moby.classify_market("Argentina vs Brazil total goals", "")[1] == "game_prop"
+          assert moby.classify_market("Messi to score anytime", "")[1] == "player_prop"
+          assert moby.classify_market("Brazil to win the World Cup", "")[1] == "future"
+
+          # 3. Holder summary computes dollar-weighted lean correctly.
+          market = {"outcomes": ["Yes", "No"], "implied_prob": [0.8, 0.2]}
+          raw = [
+              {"token": "yes", "holders": [
+                  {"outcomeIndex": 0, "amount": 1000, "name": "Whale"},
+              ]},
+              {"token": "no", "holders": [
+                  {"outcomeIndex": 1, "amount": 1000, "name": "Minnow"},
+              ]},
+          ]
+          s = moby.summarize_holders(market, raw)
+          # Yes: 1000 * 0.8 = 800; No: 1000 * 0.2 = 200 -> lean Yes ~80%
+          assert s["lean_side"] == "Yes", s
+          assert 75 <= s["lean_pct"] <= 85, s
+          assert s["total_smart_money_usd"] == 1000, s
+
+          # 4. JSON parsing handles a fenced block like the model returns.
+          sample = '''Here is my read.
           ```json
-          {"flagged": [], "near_misses": ["Brazil R16 close"], "summary": "Nothing clears the bar."}
+          {"signals": [], "watchlist": ["USA props"], "summary": "Quiet."}
           ```'''
-          parsed = vs.parse_json_block(sample)
-          assert parsed["summary"] == "Nothing clears the bar."
-          assert parsed["near_misses"] == ["Brazil R16 close"]
+          parsed = moby.parse_json_block(sample)
+          assert parsed["summary"] == "Quiet."
 
-          # 3. Discord payload builds for both the no-bet and flagged-bet cases
-          #    without raising (and without any empty field values).
-          no_bet = vs.build_discord_payload(parsed)
-          assert no_bet["embeds"][0]["title"]
+          # 5. Discord payload builds for no-signal and signal cases without
+          #    any empty field values (Discord rejects empty fields).
+          no_sig = moby.build_discord_payload(parsed)
+          assert no_sig["embeds"][0]["title"]
 
-          flagged = {
-              "flagged": [{
-                  "market": "Brazil to advance",
-                  "outcome": "Yes",
-                  "polymarket_ask_pct": 62,
-                  "fair_pct": 68,
-                  "edge_pp": 6.0,
-                  "confidence": "High",
-                  "sources": ["https://example.com"],
-                  "case_for": "Strong form.",
-                  "case_against": "Tough draw.",
-              }],
-              "summary": "One bet flagged.",
-          }
-          payload = vs.build_discord_payload(flagged)
+          full = {"signals": [{
+              "market": "Argentina vs Brazil — total goals over 2.5",
+              "smart_money_side": "Over 2.5",
+              "lean_pct": 72,
+              "total_smart_money_usd": 45000,
+              "conviction": "High",
+              "top_holders": "Theo4 $20k on Over",
+              "sentiment": "Big money piling on a high-scoring game.",
+              "contrarian_note": "Defensive matchup history.",
+          }], "summary": "One strong signal."}
+          payload = moby.build_discord_payload(full)
           for embed in payload["embeds"]:
               for field in embed.get("fields", []):
-                  assert field["value"] != "", f"empty Discord field: {field['name']}"
+                  assert field["value"] != "", f"empty field: {field['name']}"
 
-          # 4. A flagged bet with MISSING case_for/sources must still build safely
-          #    (this is the bug we fixed — empty values crash Discord).
-          sparse = {"flagged": [{
-              "market": "X", "outcome": "Y", "polymarket_ask_pct": 50,
-              "fair_pct": 60, "edge_pp": 10, "confidence": "Low",
+          # 6. A signal with MISSING fields must still build safely.
+          sparse = {"signals": [{
+              "market": "X", "smart_money_side": "Yes",
           }], "summary": "sparse"}
-          sparse_payload = vs.build_discord_payload(sparse)
-          for embed in sparse_payload["embeds"]:
+          sp = moby.build_discord_payload(sparse)
+          for embed in sp["embeds"]:
               for field in embed.get("fields", []):
-                  assert field["value"] != "", f"empty field on sparse bet: {field['name']}"
+                  assert field["value"] != "", f"empty field on sparse: {field['name']}"
 
           print("All smoke tests passed.")
           PY
