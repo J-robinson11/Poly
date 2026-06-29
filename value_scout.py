@@ -90,6 +90,37 @@ def _to_float(x, default=0.0):
         return default
 
 
+# Keyword hints for classifying a market by type. Lower number = scanned first.
+# Priority order requested: game props -> player props -> futures -> other.
+_PLAYER_HINTS = (
+    "to score", "goal scorer", "golden boot", "top scorer", "hat trick",
+    "assist", "player", "to score a goal", "anytime", "first goal",
+)
+_GAME_HINTS = (
+    " vs ", " vs.", " v ", "both teams to score", "btts", "total goals",
+    "over ", "under ", "draw", "clean sheet", "to win the match",
+    "halftime", "1st half", "first half", "correct score", "match",
+)
+_FUTURE_HINTS = (
+    "win the world cup", "to win the tournament", "champion", "winner",
+    "to reach", "reach the", "advance", "quarterfinal", "semifinal",
+    "semi-final", "quarter-final", "to make the final", "win group",
+    "group winner", "to qualify", "round of 16", "round of 32",
+)
+
+
+def classify_market(question: str, event: str) -> tuple:
+    """Return (priority, label). Lower priority is scanned/ranked first."""
+    text = f"{question} {event}".lower()
+    if any(h in text for h in _PLAYER_HINTS):
+        return (1, "player_prop")
+    if any(h in text for h in _GAME_HINTS):
+        return (0, "game_prop")
+    if any(h in text for h in _FUTURE_HINTS):
+        return (2, "future")
+    return (3, "other")
+
+
 def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list:
     """Flatten events -> markets and keep only liquid, tight-spread markets."""
     cleaned = []
@@ -106,10 +137,14 @@ def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list
             prices = [_to_float(p) for p in _as_list(m.get("outcomePrices"))]
             if not outcomes or len(outcomes) != len(prices):
                 continue
+            question = m.get("question", "")
+            priority, label = classify_market(question, ev_title)
             cleaned.append(
                 {
                     "event": ev_title,
-                    "question": m.get("question", ""),
+                    "question": question,
+                    "market_type": label,
+                    "_priority": priority,
                     "outcomes": outcomes,
                     "implied_prob": prices,           # 0-1, Polymarket mid
                     "best_ask": _to_float(m.get("bestAsk")),
@@ -119,11 +154,15 @@ def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list
                     "liquidity": liquidity,
                 }
             )
-    # Most active first; cap the list so the model stays focused + costs stay low.
-    # Tunable via MARKET_CAP env var (default 40).
-    cleaned.sort(key=lambda x: x["volume24hr"], reverse=True)
+    # Sort by requested type priority (game props first, then player props,
+    # then futures), and by 24h volume within each type. Cap the list to keep
+    # the model focused + costs down.
+    cleaned.sort(key=lambda x: (x["_priority"], -x["volume24hr"]))
     cap = int(os.environ.get("MARKET_CAP", "60"))
-    return cleaned[:cap]
+    top = cleaned[:cap]
+    for m in top:
+        m.pop("_priority", None)  # internal sort key; don't ship to the model
+    return top
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +179,18 @@ teams to score, team to qualify, and player props like player-to-score). Treat
 game props as fully in scope: they are often softer/less efficient than headline
 markets, so look hard for value there too.
 
+Each market includes a "market_type" field. Evaluate them in THIS priority
+order, spending most of your effort on the earlier ones:
+  1. game_prop  — single-match bets (match winner/draw, total goals, both teams
+                  to score). Usually the SOFTEST/least efficient — look hardest here.
+  2. player_prop — player to score, top scorer, etc. Also often soft.
+  3. future     — tournament winner, advancement, group winner. Most efficient;
+                  least likely to be mispriced.
+Game and player props are where mispricing usually hides, so prioritize them.
+
 Your job: find genuinely good value bets — outcomes where the TRUE
-probability of winning is meaningfully higher than what Polymarket is pricing.
+probability of winning is meaningfully higher than what Polymarket is pricing
+(i.e. the true win chance is higher than the price/ask you'd pay).
 
 There are TWO ways to find value — use BOTH:
 
