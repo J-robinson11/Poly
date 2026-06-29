@@ -33,7 +33,8 @@ jobs:
           # 1. The module imports cleanly and key functions exist.
           for fn in ("clean_markets", "summarize_holders", "parse_json_block",
                      "build_discord_payload", "send_alert", "log_signals",
-                     "flatten_picks", "load_track_record", "fetch_x_sentiment"):
+                     "flatten_picks", "load_track_record", "fetch_x_sentiment",
+                     "fetch_sharp_traders", "sharp_weight"):
               assert hasattr(moby, fn), f"missing function: {fn}"
 
           # 2. Market classification works.
@@ -56,6 +57,21 @@ jobs:
           assert s["lean_side"] == "Yes", s
           assert 75 <= s["lean_pct"] <= 85, s
           assert s["total_smart_money_usd"] == 1000, s
+
+          # 3b. Sharp weighting: a high-PnL whale on the smaller side flips the
+          #     SHARP lean even when raw money leans the other way.
+          mk = {"outcomes": ["Yes", "No"], "implied_prob": [0.8, 0.2]}
+          raw2 = [
+              {"holders": [{"outcomeIndex": 0, "amount": 1000, "proxyWallet": "0xAAA"}]},
+              {"holders": [{"outcomeIndex": 1, "amount": 2000, "proxyWallet": "0xBBB", "name": "Sharp"}]},
+          ]
+          sharp = {"0xbbb": {"pnl": 2_000_000, "name": "Theo4", "rank": "1"}}
+          s2 = moby.summarize_holders(mk, raw2, sharp)
+          assert s2["lean_side"] == "Yes", s2          # raw money on Yes
+          assert s2["sharp_lean_side"] == "No", s2     # sharp money flips to No
+          assert s2["sharp_traders_present"] == 1, s2
+          assert moby.sharp_weight(2_000_000) == 4.0
+          assert moby.sharp_weight(None) == 1.0
 
           # 4. JSON parsing handles a fenced block like the model returns.
           sample = '''Here is my read.

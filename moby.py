@@ -218,13 +218,65 @@ def fetch_holders(condition_id: str, limit: int = 20) -> list:
         return []
 
 
-def summarize_holders(market: dict, holders_raw: list) -> dict:
-    """Boil the raw holder lists into a compact smart-money summary.
+def fetch_sharp_traders(limit_per_page: int = 50, pages: int = 2) -> dict:
+    """Fetch all-time most-profitable traders (SPORTS + OVERALL) by lifetime PnL.
 
-    Dollar exposure ≈ shares * outcome price, so we weight by how much money is
-    actually at risk on each side (a 'No' share at 0.1 is worth far less than a
-    'Yes' share at 0.9).
+    Returns {wallet_lower: {"pnl": float, "name": str, "rank": str}} — the set of
+    historically 'sharp' wallets we weight more heavily when they show up as
+    holders. Best-effort: returns {} on error.
     """
+    sharp = {}
+    for category in ("SPORTS", "OVERALL"):
+        for page in range(pages):
+            params = {
+                "category": category, "timePeriod": "ALL", "orderBy": "PNL",
+                "limit": str(limit_per_page), "offset": str(page * limit_per_page),
+            }
+            url = f"{DATA_BASE}/v1/leaderboard?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    rows = json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                print(f"  leaderboard fetch failed ({category} p{page}): {exc}")
+                continue
+            for r in rows or []:
+                wallet = (r.get("proxyWallet") or "").lower()
+                if not wallet:
+                    continue
+                pnl = _to_float(r.get("pnl"))
+                # Keep the best (highest-PnL) record if seen in multiple lists.
+                if wallet not in sharp or pnl > sharp[wallet]["pnl"]:
+                    sharp[wallet] = {
+                        "pnl": pnl,
+                        "name": r.get("userName") or wallet[:8],
+                        "rank": r.get("rank", ""),
+                    }
+    print(f"Sharp traders loaded: {len(sharp)}")
+    return sharp
+
+
+def sharp_weight(pnl) -> float:
+    """Map a trader's lifetime PnL to a sharpness multiplier."""
+    if pnl is None:
+        return 1.0          # not a known sharp — count at face value
+    if pnl >= 1_000_000:
+        return 4.0
+    if pnl >= 250_000:
+        return 3.0
+    if pnl >= 50_000:
+        return 2.0
+    return 1.5              # on the leaderboard but smaller lifetime profit
+
+
+def summarize_holders(market: dict, holders_raw: list, sharp: dict = None) -> dict:
+    """Boil raw holder lists into a smart-money + sharp-money summary.
+
+    - Dollar exposure ≈ shares * outcome price (money actually at risk).
+    - 'Sharp' money additionally weights each holder by their lifetime PnL, so a
+      historically profitable whale counts more than a merely-large position.
+    """
+    sharp = sharp or {}
     outcomes = market["outcomes"]
     prices = market["implied_prob"]
 
@@ -234,34 +286,57 @@ def summarize_holders(market: dict, holders_raw: list) -> dict:
     def name_for(idx):
         return outcomes[idx] if isinstance(idx, int) and 0 <= idx < len(outcomes) else f"outcome {idx}"
 
-    value_by_outcome = {}
-    all_holders = []  # (usd_value, idx, name)
+    value_by_outcome = {}        # raw USD exposure
+    sharp_by_outcome = {}        # PnL-weighted USD exposure
+    all_holders = []             # (usd, idx, name)
+    notable_sharps = []          # known-sharp holders with lifetime PnL
     for group in holders_raw or []:
         for h in group.get("holders", []) or []:
             idx = h.get("outcomeIndex")
             amt = _to_float(h.get("amount"))
             usd = amt * price_for(idx)
+            side = name_for(idx)
+            wallet = (h.get("proxyWallet") or "").lower()
+            info = sharp.get(wallet)
+            pnl = info["pnl"] if info else None
+            weight = sharp_weight(pnl) if info else 1.0
             display = (
-                h.get("name") or h.get("pseudonym")
-                or (h.get("proxyWallet") or "")[:8] or "anon"
+                (info["name"] if info else None) or h.get("name") or h.get("pseudonym")
+                or (wallet[:8] if wallet else "anon")
             )
             all_holders.append((usd, idx, display))
-            value_by_outcome[name_for(idx)] = value_by_outcome.get(name_for(idx), 0.0) + usd
+            value_by_outcome[side] = value_by_outcome.get(side, 0.0) + usd
+            sharp_by_outcome[side] = sharp_by_outcome.get(side, 0.0) + usd * weight
+            if info:
+                notable_sharps.append({
+                    "name": display, "side": side,
+                    "position_usd": round(usd, 0), "lifetime_pnl": round(pnl, 0),
+                })
 
     value_by_outcome = {k: round(v, 0) for k, v in value_by_outcome.items()}
+    sharp_by_outcome = {k: round(v, 0) for k, v in sharp_by_outcome.items()}
     total = sum(value_by_outcome.values())
+    sharp_total = sum(sharp_by_outcome.values())
+
     lean_side = max(value_by_outcome, key=value_by_outcome.get) if value_by_outcome else None
     lean_pct = round(100 * value_by_outcome.get(lean_side, 0) / total, 1) if total else 0.0
+    sharp_lean = max(sharp_by_outcome, key=sharp_by_outcome.get) if sharp_by_outcome else None
+    sharp_pct = round(100 * sharp_by_outcome.get(sharp_lean, 0) / sharp_total, 1) if sharp_total else 0.0
 
     top = sorted(all_holders, key=lambda t: t[0], reverse=True)[:5]
-    top_holders = [
-        {"name": n, "side": name_for(i), "usd": round(v, 0)} for v, i, n in top
-    ]
+    top_holders = [{"name": n, "side": name_for(i), "usd": round(v, 0)} for v, i, n in top]
+    notable_sharps.sort(key=lambda x: x["lifetime_pnl"], reverse=True)
+
     return {
         "smart_money_usd_by_outcome": value_by_outcome,
         "total_smart_money_usd": round(total, 0),
         "lean_side": lean_side,
-        "lean_pct": lean_pct,  # % of big money $ sitting on lean_side
+        "lean_pct": lean_pct,                       # % of raw big money on lean_side
+        "sharp_money_by_outcome": sharp_by_outcome,
+        "sharp_lean_side": sharp_lean,              # where the HISTORICALLY SHARP money leans
+        "sharp_lean_pct": sharp_pct,
+        "sharp_traders_present": len(notable_sharps),
+        "notable_sharps": notable_sharps[:5],       # name, side, position, lifetime PnL
         "top_holders": top_holders,
         "holders_counted": len(all_holders),
     }
@@ -273,15 +348,22 @@ def attach_smart_money(markets: list, min_smart_usd: float) -> list:
     Keeps condition_id on each market (used later for logging + grading); it is
     stripped from the model's view in run_analysis.
     """
+    sharp = fetch_sharp_traders()
     kept = []
     for m in markets:
-        summary = summarize_holders(m, fetch_holders(m["condition_id"]))
+        summary = summarize_holders(m, fetch_holders(m["condition_id"]), sharp)
         if summary["total_smart_money_usd"] < min_smart_usd:
             continue
         m["smart_money"] = summary
         kept.append(m)
+    # Surface markets where SHARP traders are present + concentrated first, then
+    # fall back to raw money size.
     kept.sort(
-        key=lambda x: (x["smart_money"]["total_smart_money_usd"], x["smart_money"]["lean_pct"]),
+        key=lambda x: (
+            x["smart_money"]["sharp_traders_present"],
+            x["smart_money"]["sharp_lean_pct"],
+            x["smart_money"]["total_smart_money_usd"],
+        ),
         reverse=True,
     )
     return kept
@@ -395,13 +477,20 @@ game props, player props, and futures.
 
 You weigh MULTIPLE sentiment factors for each market, in roughly this priority:
 
-1. SMART MONEY (primary). Each market has a "smart_money" block from the largest
-   on-chain holders / P&L:
-     - smart_money_usd_by_outcome: approx USD the top holders hold on each side
-     - total_smart_money_usd: total big-money dollars in the market
-     - lean_side / lean_pct: which side the big money leans, and its $ share
-     - top_holders: the single largest individual positions (name, side, USD)
-   A heavy, well-funded, lopsided lean is the strongest signal.
+1. SMART / SHARP MONEY (primary). Each market has a "smart_money" block built
+   from the largest on-chain holders, cross-referenced against Polymarket's
+   all-time profit leaderboard:
+     - smart_money_usd_by_outcome / total_smart_money_usd / lean_side / lean_pct:
+       RAW big-money positioning (biggest dollars right now).
+     - sharp_money_by_outcome / sharp_lean_side / sharp_lean_pct: positioning
+       WEIGHTED by each holder's lifetime PnL — i.e. where the historically
+       PROFITABLE whales lean. This is the higher-quality signal.
+     - notable_sharps: the proven-profitable holders in this market, with their
+       side, position size, and lifetime PnL.
+     - top_holders: the single largest positions regardless of track record.
+   Weight SHARP money above raw size: a market where proven winners are
+   concentrated on one side is stronger than one that's merely big. When raw
+   money and sharp money DISAGREE, trust the sharp side and flag the divergence.
 
 2. NEWS / PUBLIC SENTIMENT (web search). Use web search to check recent (24-48h)
    news, form, injuries, lineups, and public lean for the relevant teams/players.
@@ -444,7 +533,7 @@ exactly this schema:
         "pick": "<the outcome you'd back>",
         "conviction": "High|Medium|Low",
         "kickoff": "<ISO time if known, else ''>",
-        "smart_money": "<short note: lean side, % and $ of big money>",
+        "smart_money": "<short note: RAW lean (side, % and $) AND sharp lean (where proven winners sit, named if notable)>",
         "news": "<short note: what recent news/sentiment says>",
         "rationale": "<one or two sentences combining the factors>",
         "contrarian_note": "<one sentence on the main risk, or 'none'>"
