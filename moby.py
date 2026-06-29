@@ -268,16 +268,18 @@ def summarize_holders(market: dict, holders_raw: list) -> dict:
 
 
 def attach_smart_money(markets: list, min_smart_usd: float) -> list:
-    """Fetch + attach holder summaries; drop markets with little big money."""
+    """Fetch + attach holder summaries; drop markets with little big money.
+
+    Keeps condition_id on each market (used later for logging + grading); it is
+    stripped from the model's view in run_analysis.
+    """
     kept = []
     for m in markets:
         summary = summarize_holders(m, fetch_holders(m["condition_id"]))
         if summary["total_smart_money_usd"] < min_smart_usd:
             continue
         m["smart_money"] = summary
-        m.pop("condition_id", None)  # internal; don't ship to the model
         kept.append(m)
-    # Strongest / most lopsided big-money interest first.
     kept.sort(
         key=lambda x: (x["smart_money"]["total_smart_money_usd"], x["smart_money"]["lean_pct"]),
         reverse=True,
@@ -286,39 +288,148 @@ def attach_smart_money(markets: list, min_smart_usd: float) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Extra sentiment factors: track record (graded log) + X feeds (stub)
+# ---------------------------------------------------------------------------
+def fetch_market_resolution(condition_id: str):
+    """Return (closed, winning_outcome_name) for a market, or (False, None)."""
+    if not condition_id:
+        return (False, None)
+    params = {"condition_ids": condition_id}
+    url = f"{GAMMA_BASE}/markets?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        m = data[0] if isinstance(data, list) and data else data
+        if not isinstance(m, dict) or not m.get("closed"):
+            return (False, None)
+        outcomes = _as_list(m.get("outcomes"))
+        prices = [_to_float(p) for p in _as_list(m.get("outcomePrices"))]
+        if outcomes and prices and len(outcomes) == len(prices):
+            win_idx = max(range(len(prices)), key=lambda i: prices[i])
+            return (True, outcomes[win_idx])
+        return (True, None)
+    except Exception:  # noqa: BLE001 — grading is best-effort
+        return (False, None)
+
+
+def load_track_record(grade_limit: int = 25) -> dict:
+    """Read signals_log.jsonl and grade resolved past picks (best-effort).
+
+    Returns a compact summary used as a sentiment factor: how Moby's prior
+    calls have actually resolved, by category, plus a few recent wins.
+    """
+    log_path = os.path.join(os.path.dirname(__file__), "signals_log.jsonl")
+    if not os.path.exists(log_path):
+        return {"status": "no_history", "note": "No prior signals logged yet."}
+
+    rows = []
+    try:
+        with open(log_path) as f:
+            for line in f.read().splitlines()[-300:]:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    except Exception:  # noqa: BLE001
+        return {"status": "unreadable", "note": "Could not read signal log."}
+
+    graded = {"win": 0, "loss": 0}
+    by_cat = {}
+    recent_wins = []
+    # Grade most-recent first, capped to bound network calls.
+    for row in reversed(rows[-grade_limit:]):
+        cid = row.get("condition_id")
+        pick = row.get("smart_money_side") or row.get("pick")
+        cat = row.get("market_type", "other")
+        if not cid or not pick:
+            continue
+        closed, winner = fetch_market_resolution(cid)
+        if not closed or winner is None:
+            continue
+        won = (str(pick).strip().lower() == str(winner).strip().lower())
+        graded["win" if won else "loss"] += 1
+        c = by_cat.setdefault(cat, {"win": 0, "loss": 0})
+        c["win" if won else "loss"] += 1
+        if won and len(recent_wins) < 5:
+            recent_wins.append(f"{pick} — {row.get('market', '')[:60]}")
+
+    total_graded = graded["win"] + graded["loss"]
+    win_rate = round(100 * graded["win"] / total_graded, 1) if total_graded else None
+    return {
+        "status": "graded" if total_graded else "pending",
+        "total_logged": len(rows),
+        "graded": total_graded,
+        "wins": graded["win"],
+        "losses": graded["loss"],
+        "win_rate_pct": win_rate,
+        "by_category": by_cat,
+        "recent_wins": recent_wins,
+        "note": (
+            f"{graded['win']}/{total_graded} graded picks won "
+            f"({win_rate}%)." if total_graded else
+            "Picks logged but none resolved yet — track record still building."
+        ),
+    }
+
+
+def fetch_x_sentiment(markets: list) -> dict:
+    """X/Twitter sentiment input. STUB — wired as a factor slot for later.
+
+    Activates only if X_BEARER_TOKEN is set; even then returns a clearly-labeled
+    placeholder until the feed integration is implemented.
+    """
+    if not os.environ.get("X_BEARER_TOKEN"):
+        return {"status": "not_configured",
+                "note": "X/Twitter feed not connected yet (planned input)."}
+    return {"status": "stub",
+            "note": "X_BEARER_TOKEN set but feed parsing not implemented yet."}
+
+
+# ---------------------------------------------------------------------------
 # 3. Claude (Moby) — smart-money sentiment read
 # ---------------------------------------------------------------------------
 ANALYSIS_INSTRUCTIONS = """\
-You are "Moby," a smart-money sentiment analyst for Polymarket.
+You are "Moby," a multi-factor sentiment analyst for Polymarket. Your job each
+run: produce a DAILY SLATE of World Cup bets, broken into three buckets —
+game props, player props, and futures.
 
-You are given a list of live Polymarket markets. For EACH market you get a
-"smart_money" block summarizing the LARGEST holders (the biggest money / P&L)
-on each outcome:
-  - smart_money_usd_by_outcome: approx USD exposure the top holders have on each side
-  - total_smart_money_usd: total big-money dollars across the market's top holders
-  - lean_side / lean_pct: which side the big money leans, and what share of the
-    big-money dollars sit there
-  - top_holders: the single largest individual positions (name, side, USD)
+You weigh MULTIPLE sentiment factors for each market, in roughly this priority:
 
-Your job is SENTIMENT, not fair-value math. Read where the smart money is
-positioned and how strong the signal is. Surface the markets where the big money
-is most clearly and confidently leaning one way.
+1. SMART MONEY (primary). Each market has a "smart_money" block from the largest
+   on-chain holders / P&L:
+     - smart_money_usd_by_outcome: approx USD the top holders hold on each side
+     - total_smart_money_usd: total big-money dollars in the market
+     - lean_side / lean_pct: which side the big money leans, and its $ share
+     - top_holders: the single largest individual positions (name, side, USD)
+   A heavy, well-funded, lopsided lean is the strongest signal.
 
-How to judge a signal's strength (conviction):
-  - High:   big money is heavily lopsided (lean_pct high, e.g. 70%+), backed by
-            sizable total_smart_money_usd, and one or more large individual whales
-            on that side.
-  - Medium: a clear lean (≈ 60-70%) with decent money behind it.
-  - Low:    only a mild lean, thin money, or the big holders are split.
+2. NEWS / PUBLIC SENTIMENT (web search). Use web search to check recent (24-48h)
+   news, form, injuries, lineups, and public lean for the relevant teams/players.
+   Does the news AGREE with the smart money (confirmation) or CONTRADICT it
+   (contrarian risk)?
 
-You MAY use web search sparingly to add a one-line context note (recent news that
-explains or challenges the positioning), but the smart-money data is the primary
-driver — do not turn this into a fair-value/odds analysis.
+3. X / SOCIAL FEED. Provided in the input as "x_sentiment". It may be a
+   placeholder ("not connected yet") — if so, simply note it's unavailable and
+   weigh the other factors. Treat it as a factor slot for the future.
 
-Surface the strongest 3-6 signals, ranked by conviction then total_smart_money_usd.
-It is fine to return more or fewer. Add a short contrarian_note when the crowd
-looks like it might be wrong (e.g. money piled on a heavy favorite the news cuts
-against). Never invent holders or numbers that aren't in the data.
+4. TRACK RECORD. Provided as "track_record" — how Moby's own prior logged picks
+   have actually resolved (win rate overall and by category, recent wins). Use it
+   to CALIBRATE confidence: if a category has been hitting, lean into it slightly;
+   if it's been missing, be more cautious there. Do not over-fit a tiny sample.
+
+You give a DAILY SLATE, so try to surface the best play(s) in EACH bucket — but
+only where the factors actually support a pick. Up to ~3 per bucket. If a bucket
+has nothing worth betting today, return an empty list for it and say so in the
+summary. Prefer UPCOMING games (soonest kickoff) for the prop buckets.
+
+Conviction:
+  - High:   smart money heavily lopsided AND news agrees AND (if available) the
+            category's track record is decent.
+  - Medium: a clear lean with at least one corroborating factor.
+  - Low:    mild/mixed signal — list it as a speculative play, labeled Low.
+
+Never invent holders, numbers, or news. Add a contrarian_note whenever the
+factors disagree (e.g. big money piled on a favorite the news cuts against).
 
 Output your final answer as a single fenced JSON block and NOTHING after it, in
 exactly this schema:
@@ -326,26 +437,28 @@ exactly this schema:
 ```json
 {
   "generated_at": "<ISO8601 UTC>",
-  "signals": [
-    {
-      "market": "<exact market question>",
-      "smart_money_side": "<the outcome the big money favors>",
-      "lean_pct": <number 0-100, share of big money on that side>,
-      "total_smart_money_usd": <number>,
-      "conviction": "High|Medium|Low",
-      "top_holders": "<short readable note on the largest positions>",
-      "sentiment": "<one or two sentences: what the smart money is saying>",
-      "contrarian_note": "<one sentence on why the big money could be wrong, or 'none'>"
-    }
-  ],
-  "watchlist": ["<short note on 1-3 markets with notable but weaker signals>"],
-  "summary": "<one-line plain-English summary of this run>"
+  "picks": {
+    "game_props": [
+      {
+        "market": "<exact market question>",
+        "pick": "<the outcome you'd back>",
+        "conviction": "High|Medium|Low",
+        "kickoff": "<ISO time if known, else ''>",
+        "smart_money": "<short note: lean side, % and $ of big money>",
+        "news": "<short note: what recent news/sentiment says>",
+        "rationale": "<one or two sentences combining the factors>",
+        "contrarian_note": "<one sentence on the main risk, or 'none'>"
+      }
+    ],
+    "player_props": [ /* same shape */ ],
+    "futures": [ /* same shape */ ]
+  },
+  "watchlist": ["<1-3 notable markets that just missed and why>"],
+  "summary": "<one-line plain-English summary of today's slate>"
 }
 ```
-If nothing is strong, return "signals": [] (still include watchlist + summary).
-
-IMPORTANT: Keep reasoning concise. End with the JSON block and nothing after it.
-The JSON block MUST appear or the run fails.
+If a bucket has no good play, use an empty list for it. Keep reasoning concise.
+End with the JSON block and nothing after it. The JSON block MUST appear.
 """
 
 
@@ -377,18 +490,29 @@ def estimate_cost(model: str, usage) -> dict:
     }
 
 
-def run_analysis(client: Anthropic, model: str, markets: list) -> dict:
-    payload = json.dumps(markets, indent=2)
+def run_analysis(client: Anthropic, model: str, markets: list,
+                 track_record: dict, x_sentiment: dict) -> dict:
+    # Strip internal-only fields from the model's view of each market.
+    model_view = [
+        {k: v for k, v in m.items() if not k.startswith("_") and k != "condition_id"}
+        for m in markets
+    ]
+    payload = {
+        "markets": model_view,
+        "track_record": track_record,
+        "x_sentiment": x_sentiment,
+    }
     user = (
-        "Here are live Polymarket markets with their largest-holder (smart money) "
-        "summaries. Read the sentiment and return the JSON.\n\n"
-        f"{payload}"
+        "Here are live Polymarket World Cup markets with their largest-holder "
+        "(smart money) summaries, plus your track record and the X-sentiment slot. "
+        "Weigh all factors and return today's slate as JSON.\n\n"
+        f"{json.dumps(payload, indent=2)}"
     )
     resp = client.messages.create(
         model=model,
         max_tokens=8000,
         system=ANALYSIS_INSTRUCTIONS,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
         messages=[{"role": "user", "content": user}],
     )
 
@@ -431,15 +555,40 @@ def parse_json_block(text: str) -> dict:
 # ---------------------------------------------------------------------------
 # 4. Signal tracking — append flagged signals to signals_log.jsonl
 # ---------------------------------------------------------------------------
-def log_signals(result: dict, run_at: str) -> None:
+BUCKETS = ("game_props", "player_props", "futures")
+_BUCKET_TO_TYPE = {"game_props": "game_prop", "player_props": "player_prop", "futures": "future"}
+
+
+def flatten_picks(result: dict) -> list:
+    """Flatten result['picks'] into a single list, tagging each with its bucket."""
+    picks = result.get("picks", {}) or {}
+    out = []
+    for bucket in BUCKETS:
+        for p in picks.get(bucket, []) or []:
+            out.append({**p, "bucket": bucket, "market_type": _BUCKET_TO_TYPE[bucket]})
+    return out
+
+
+def log_signals(result: dict, run_at: str, cid_by_market: dict) -> None:
+    """Append each pick to signals_log.jsonl, enriched with condition_id so it
+    can be graded (win/loss) on future runs."""
     log_path = os.path.join(os.path.dirname(__file__), "signals_log.jsonl")
-    signals = result.get("signals", [])
-    if not signals:
+    picks = flatten_picks(result)
+    if not picks:
         return
     with open(log_path, "a") as f:
-        for sig in signals:
-            f.write(json.dumps({"run_at": run_at, **sig}) + "\n")
-    print(f"Logged {len(signals)} signal(s) to signals_log.jsonl")
+        for p in picks:
+            cid = cid_by_market.get(p.get("market", ""), "")
+            record = {
+                "run_at": run_at,
+                "market": p.get("market", ""),
+                "smart_money_side": p.get("pick", ""),
+                "conviction": p.get("conviction", ""),
+                "market_type": p.get("market_type", "other"),
+                "condition_id": cid,
+            }
+            f.write(json.dumps(record) + "\n")
+    print(f"Logged {len(picks)} pick(s) to signals_log.jsonl")
 
 
 def commit_log() -> None:
@@ -469,55 +618,70 @@ def _fmt_list(items) -> str:
     return "\n".join(f"• {str(x)}" for x in items)[:1024]
 
 
-def build_discord_payload(result: dict) -> dict:
-    signals = result.get("signals", [])
-    summary = result.get("summary", "No strong smart-money signals this run.")
-    watchlist = result.get("watchlist", [])
-    n_eval = result.get("markets_evaluated")
-    scanned = f" ({n_eval} markets scanned)" if n_eval else ""
+_BUCKET_LABEL = {"game_props": "GAME PROP", "player_props": "PLAYER PROP", "futures": "FUTURE"}
 
-    if not signals:
+
+def build_discord_payload(result: dict) -> dict:
+    summary = result.get("summary", "No bets on today's slate.")
+    watchlist = result.get("watchlist", [])
+    tr = result.get("_track_record", {})
+    n_eval = result.get("markets_evaluated")
+    scanned = f" · {n_eval} markets" if n_eval else ""
+    tr_note = f" · {tr.get('note')}" if tr.get("note") else ""
+
+    picks = flatten_picks(result)
+    if not picks:
         return {
             "username": "Moby",
             "embeds": [{
-                "title": "No strong smart-money signals",
+                "title": "No bets on today's slate",
                 "description": summary[:4096],
                 "color": 0x95A5A6,
-                "fields": [
-                    {"name": "Watchlist (weaker signals)",
-                     "value": _fmt_list(watchlist), "inline": False},
-                ],
-                "footer": {"text": f"Moby · smart-money sentiment{scanned}"},
+                "fields": [{"name": "Watchlist", "value": _fmt_list(watchlist), "inline": False}],
+                "footer": {"text": f"Moby · multi-factor sentiment{scanned}{tr_note}"},
             }],
         }
 
-    embeds = []
-    for sig in signals:
-        conf = sig.get("conviction", "Low")
+    # Header embed summarizing the slate, then one card per pick (game→player→future).
+    counts = {b: 0 for b in BUCKETS}
+    for p in picks:
+        counts[p["bucket"]] += 1
+    header_lines = ", ".join(
+        f"{counts[b]} {_BUCKET_LABEL[b].lower()}{'s' if counts[b] != 1 else ''}" for b in BUCKETS
+    )
+    embeds = [{
+        "username": "Moby",
+        "title": "🐋 Moby — Today's World Cup slate",
+        "description": f"{summary}\n\n**{header_lines}**"[:4096],
+        "color": 0x3498DB,
+        "footer": {"text": f"Multi-factor sentiment{scanned}{tr_note}"},
+    }]
+
+    for p in picks:
+        conf = p.get("conviction", "Low")
         color = CONF_COLOR.get(conf, 0x95A5A6)
-        lean = round(_to_float(sig.get("lean_pct")))
-        money = _to_float(sig.get("total_smart_money_usd"))
-        money_str = f"${money:,.0f}"
+        kickoff = p.get("kickoff") or ""
         fields = [
-            {"name": "Big money on", "value": str(sig.get("smart_money_side") or "—")[:256], "inline": True},
-            {"name": "Lean", "value": f"{lean}% of $", "inline": True},
+            {"name": "Pick", "value": str(p.get("pick") or "—")[:256], "inline": True},
             {"name": "Conviction", "value": conf, "inline": True},
-            {"name": "Smart money", "value": money_str, "inline": True},
-            {"name": "Largest positions", "value": (str(sig.get("top_holders") or "n/a"))[:1024], "inline": False},
-            {"name": "What it's saying", "value": (str(sig.get("sentiment") or "n/a"))[:1024], "inline": False},
-            {"name": "Contrarian flag", "value": (str(sig.get("contrarian_note") or "none"))[:1024], "inline": False},
+            {"name": "Bucket", "value": _BUCKET_LABEL.get(p["bucket"], p["bucket"]), "inline": True},
+            {"name": "Smart money", "value": (str(p.get("smart_money") or "n/a"))[:1024], "inline": False},
+            {"name": "News / sentiment", "value": (str(p.get("news") or "n/a"))[:1024], "inline": False},
+            {"name": "Why", "value": (str(p.get("rationale") or "n/a"))[:1024], "inline": False},
+            {"name": "Contrarian flag", "value": (str(p.get("contrarian_note") or "none"))[:1024], "inline": False},
         ]
+        title = f"[{_BUCKET_LABEL[p['bucket']]}] {p.get('pick')}"
+        if kickoff:
+            title += f" · {kickoff[:16]}"
         embeds.append({
-            "title": f"SMART MONEY: {sig.get('smart_money_side')}"[:256],
-            "description": (sig.get("market") or "")[:4096],
+            "title": title[:256],
+            "description": (p.get("market") or "")[:4096],
             "color": color,
             "fields": fields,
-            "footer": {"text": "Smart-money positioning, not advice. Confirm in your Polymarket app."},
+            "footer": {"text": "Sentiment read, not advice. Confirm in your Polymarket app."},
         })
 
-    if len(embeds) > 1:
-        embeds[0]["description"] += f"\n\n**{len(embeds)} signals this run — see all cards below.**"
-    return {"username": "Moby", "embeds": embeds[:10]}
+    return {"username": "Moby", "embeds": embeds[:10]}  # Discord max 10 embeds
 
 
 def send_alert(result: dict) -> None:
@@ -529,18 +693,17 @@ def send_alert(result: dict) -> None:
         print("Alert sent via Discord webhook.")
         return
 
-    signals = result.get("signals", [])
+    picks = flatten_picks(result)
     summary = result.get("summary", "")
-    if not signals:
-        body = f"Moby: no strong smart-money signals this run. {summary}"
+    if not picks:
+        body = f"Moby: no bets on today's slate. {summary}"
     else:
-        top = signals[0]
-        extra = f" (+{len(signals) - 1} more)" if len(signals) > 1 else ""
+        top = picks[0]
+        extra = f" (+{len(picks) - 1} more)" if len(picks) > 1 else ""
         body = (
-            f"Moby smart-money: big money on {top.get('smart_money_side')} — "
-            f"{top.get('market')}. {round(_to_float(top.get('lean_pct')))}% of "
-            f"${_to_float(top.get('total_smart_money_usd')):,.0f} ({top.get('conviction')} conviction)"
-            f"{extra}. Not financial advice."
+            f"Moby slate: [{_BUCKET_LABEL.get(top['bucket'], '')}] {top.get('pick')} — "
+            f"{top.get('market')} ({top.get('conviction')} conviction){extra}. "
+            f"Not financial advice."
         )[:600]
 
     if os.environ.get("NTFY_TOPIC"):
@@ -602,17 +765,28 @@ def main() -> int:
         print("No markets cleared the smart-money threshold. Exiting quietly.")
         return 0
 
+    # Build market -> condition_id map for logging/grading before the model view.
+    cid_by_market = {m["question"]: m.get("condition_id", "") for m in markets}
+
+    # Extra sentiment factors.
+    track_record = load_track_record()
+    x_sentiment = fetch_x_sentiment(markets)
+    print("Track record:", track_record.get("note", ""))
+    print("X sentiment:", x_sentiment.get("note", ""))
+
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    result = run_analysis(client, model, markets)
+    result = run_analysis(client, model, markets, track_record, x_sentiment)
     result["markets_evaluated"] = len(markets)
+    result["_track_record"] = track_record
 
     print("Summary:", result.get("summary", ""))
     print("Watchlist:", result.get("watchlist", []))
-    signals = result.get("signals", [])
-    print(f"Signals: {len(signals)}")
+    picks = flatten_picks(result)
+    print(f"Picks: {len(picks)} "
+          f"({', '.join(b + '=' + str(sum(1 for p in picks if p['bucket'] == b)) for b in BUCKETS)})")
     print(json.dumps(result, indent=2))
 
-    log_signals(result, now)
+    log_signals(result, now, cid_by_market)
     commit_log()
 
     if dry_run:

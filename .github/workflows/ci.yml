@@ -32,7 +32,8 @@ jobs:
 
           # 1. The module imports cleanly and key functions exist.
           for fn in ("clean_markets", "summarize_holders", "parse_json_block",
-                     "build_discord_payload", "send_alert", "log_signals"):
+                     "build_discord_payload", "send_alert", "log_signals",
+                     "flatten_picks", "load_track_record", "fetch_x_sentiment"):
               assert hasattr(moby, fn), f"missing function: {fn}"
 
           # 2. Market classification works.
@@ -59,39 +60,34 @@ jobs:
           # 4. JSON parsing handles a fenced block like the model returns.
           sample = '''Here is my read.
           ```json
-          {"signals": [], "watchlist": ["USA props"], "summary": "Quiet."}
+          {"picks": {"game_props": [], "player_props": [], "futures": []},
+           "watchlist": ["USA props"], "summary": "Quiet."}
           ```'''
           parsed = moby.parse_json_block(sample)
           assert parsed["summary"] == "Quiet."
+          assert moby.flatten_picks(parsed) == []
 
-          # 5. Discord payload builds for no-signal and signal cases without
-          #    any empty field values (Discord rejects empty fields).
-          no_sig = moby.build_discord_payload(parsed)
-          assert no_sig["embeds"][0]["title"]
+          # 5. Discord payload builds for no-pick and full slates without any
+          #    empty field values (Discord rejects empty fields).
+          no_pick = moby.build_discord_payload(parsed)
+          assert no_pick["embeds"][0]["title"]
 
-          full = {"signals": [{
-              "market": "Argentina vs Brazil — total goals over 2.5",
-              "smart_money_side": "Over 2.5",
-              "lean_pct": 72,
-              "total_smart_money_usd": 45000,
-              "conviction": "High",
-              "top_holders": "Theo4 $20k on Over",
-              "sentiment": "Big money piling on a high-scoring game.",
-              "contrarian_note": "Defensive matchup history.",
-          }], "summary": "One strong signal."}
+          full = {"picks": {
+              "game_props": [{
+                  "market": "Argentina vs Brazil — total goals over 2.5",
+                  "pick": "Over 2.5", "conviction": "High", "kickoff": "2026-06-29T18:00:00Z",
+                  "smart_money": "72% of $45k on Over", "news": "Both teams attacking form.",
+                  "rationale": "Big money + news agree.", "contrarian_note": "Defensive history.",
+              }],
+              "player_props": [{"market": "Messi to score", "pick": "Yes", "conviction": "Medium"}],
+              "futures": [],
+          }, "summary": "Two plays today.", "_track_record": {"note": "3/4 won (75%)."}}
+          flat = moby.flatten_picks(full)
+          assert len(flat) == 2 and flat[0]["bucket"] == "game_props", flat
           payload = moby.build_discord_payload(full)
           for embed in payload["embeds"]:
               for field in embed.get("fields", []):
                   assert field["value"] != "", f"empty field: {field['name']}"
-
-          # 6. A signal with MISSING fields must still build safely.
-          sparse = {"signals": [{
-              "market": "X", "smart_money_side": "Yes",
-          }], "summary": "sparse"}
-          sp = moby.build_discord_payload(sparse)
-          for embed in sp["embeds"]:
-              for field in embed.get("fields", []):
-                  assert field["value"] != "", f"empty field on sparse: {field['name']}"
 
           print("All smoke tests passed.")
           PY
