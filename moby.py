@@ -44,7 +44,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from anthropic import Anthropic
@@ -153,6 +153,42 @@ def classify_market(question: str, event: str) -> tuple:
     return (3, "other")
 
 
+def run_slot_label(now_utc: datetime = None) -> str:
+    """Label the run by its nearest scheduled Central slot, e.g. '5:00 PM'.
+
+    The cron fires ~7:20a / 12:20p / 5:20p CT (with GitHub drift); we snap to the
+    clean 7AM / 12PM / 5PM slot. World Cup is summer, so Central = UTC-5 (CDT).
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    ct = now_utc - timedelta(hours=5)
+    hr = ct.hour + ct.minute / 60.0
+    nearest = min((7, 12, 17), key=lambda s: abs(s - hr))
+    ampm = "AM" if nearest < 12 else "PM"
+    h12 = nearest if nearest <= 12 else nearest - 12
+    return f"{h12}:00 {ampm}"
+
+
+def prune_low_upside(result: dict, max_price: float = 0.90, min_price: float = 0.05) -> int:
+    """Drop picks with no real upside (priced >= max_price, e.g. a 100¢ lock) or
+    pure longshots (<= min_price). Hard backstop so a 0%-payout pick never ships."""
+    picks = result.get("picks", {}) or {}
+    removed = 0
+    for b in BUCKETS:
+        kept = []
+        for p in picks.get(b, []) or []:
+            try:
+                pr = float(p.get("price"))
+            except (TypeError, ValueError):
+                pr = None
+            if pr is not None and (pr >= max_price or pr <= min_price):
+                removed += 1
+                continue
+            kept.append(p)
+        picks[b] = kept
+    result["picks"] = picks
+    return removed
+
+
 def payouts_for(outcomes: list, prices: list) -> dict:
     """For each outcome, the back price and the upside if it wins.
 
@@ -217,9 +253,31 @@ def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list
     futures_slots = int(os.environ.get("FUTURES_SLOTS", "4"))
     futures_slots = max(0, min(futures_slots, cap))
 
-    props = [m for m in cleaned if m["_priority"] in (0, 1, 3)]
+    # --- Time window: prioritize the games that are about to happen, drop the
+    # ones already (nearly) over. Each run focuses on its own slice of the day. ---
+    now_ts = datetime.now(timezone.utc).timestamp()
+    grace = float(os.environ.get("LIVE_GRACE_MIN", "75")) * 60      # drop games kicked off > this ago
+    window = float(os.environ.get("WINDOW_HOURS", "12")) * 3600     # "soon" = within this many hours
+    for m in cleaned:
+        m["_ttk"] = (m["_ts"] - now_ts) if m["_ts"] != _FAR_FUTURE else None  # seconds to kickoff
+
+    def prop_key(m):
+        """Tier 0 = upcoming soon, 1 = live (just started), 2 = far upcoming,
+        3 = undated. Within a tier: game props before player, soonest first."""
+        ttk = m["_ttk"]
+        if ttk is None:
+            return (3, m["_priority"], 0)
+        if ttk >= 0:
+            tier = 0 if ttk <= window else 2
+            return (tier, m["_priority"], ttk)
+        return (1, m["_priority"], -ttk)  # in-play, recently kicked off
+
+    # Exclude finished/late props (kicked off more than `grace` ago).
+    props = [m for m in cleaned
+             if m["_priority"] in (0, 1, 3)
+             and not (m["_ttk"] is not None and m["_ttk"] < -grace)]
     futures = [m for m in cleaned if m["_priority"] == 2]
-    props.sort(key=lambda x: (x["_priority"], x["_ts"], -x["volume24hr"]))
+    props.sort(key=prop_key)
     futures.sort(key=lambda x: (x["_ts"], -x["volume24hr"]))
 
     props_slots = cap - futures_slots
@@ -228,12 +286,12 @@ def clean_markets(events: list, min_liquidity: float, max_spread: float) -> list
         chosen = {id(m) for m in selected}
         leftovers = [m for m in props[props_slots:] + futures[futures_slots:]
                      if id(m) not in chosen]
-        leftovers.sort(key=lambda x: (x["_priority"], x["_ts"], -x["volume24hr"]))
         selected += leftovers[: cap - len(selected)]
 
     for m in selected:
         m.pop("_priority", None)
         m.pop("_ts", None)
+        m.pop("_ttk", None)
     return selected
 
 
@@ -547,6 +605,13 @@ PAYOFF MATTERS — this is important. The user wants bets that actually MAKE MON
 not near-certain favorites with trivial upside. Each market includes
 "payout_by_outcome" with each side's back price, profit_pct (return per $1 if it
 wins), and multiple. Apply these rules:
+  - HARD RULE: NEVER output a pick priced >= 0.90 (≤ ~11% upside), and never a
+    pick priced 1.0 / 100¢ (already resolved, ZERO upside). These are pointless —
+    exclude them entirely, no matter how strong the smart money is. A "100¢ both
+    teams to score, High conviction" pick is exactly what NOT to send.
+  - Conviction (High/green) is about SIGNAL STRENGTH **and real payout** — it is
+    NOT a measure of how certain/expensive the market already is. Do not mark a
+    near-resolved favorite "High".
   - AVOID picks whose back price is >= 0.85 (return under ~18%) UNLESS conviction
     is exceptional and the sharp evidence is overwhelming. A 90%-priced favorite
     is usually NOT worth surfacing — there's no real money in it.
@@ -557,11 +622,21 @@ wins), and multiple. Apply these rules:
   - Prefer the higher-payout pick when two candidates have similar conviction.
   - Always report the pick's price and payout so the user sees the upside.
 
+TIMING — THIS RUN HAS A WINDOW. "run_context" gives the current time (now_utc),
+this run's label, and a window. Each market has a "starts" time. Rules:
+  - Recommend bets on games that are UPCOMING (kicking off after now) — prioritize
+    the SOONEST upcoming matches in this run's window.
+  - A game that already kicked off and is late/most-of-the-way through is STALE —
+    do NOT recommend it (e.g. don't pick a game that's in the 80th minute). The
+    next run will have already moved on; so should you.
+  - Do not re-recommend the same game a previous run already covered if it's now
+    underway — move to the next slate of games.
+
 MATCH-LEVEL BETS ARE THE PRIORITY. Spend the slate on game props and player
-props for upcoming/live matches. Futures (tournament winner, etc.) are only a
-GLANCE: include AT MOST 1 futures pick, and only if it's genuinely exceptional.
-If upcoming matches exist in the input, you MUST surface the best game/player
-props before considering any future. Do not fill the slate with futures.
+props for upcoming matches. Futures (tournament winner, etc.) are only a GLANCE:
+include AT MOST 1 futures pick, and only if it's genuinely exceptional. If
+upcoming matches exist, you MUST surface the best game/player props before any
+future. Do not fill the slate with futures.
 
 Up to ~3 game props and ~3 player props, plus at most 1 future. Only where the
 factors AND the payoff support a pick; otherwise return an empty list for that
@@ -642,13 +717,14 @@ def estimate_cost(model: str, usage) -> dict:
 
 
 def run_analysis(client: Anthropic, model: str, markets: list,
-                 track_record: dict, x_sentiment: dict) -> dict:
+                 track_record: dict, x_sentiment: dict, run_context: dict) -> dict:
     # Strip internal-only fields from the model's view of each market.
     model_view = [
         {k: v for k, v in m.items() if not k.startswith("_") and k != "condition_id"}
         for m in markets
     ]
     payload = {
+        "run_context": run_context,
         "markets": model_view,
         "track_record": track_record,
         "x_sentiment": x_sentiment,
@@ -789,20 +865,21 @@ _BUCKET_LABEL = {"game_props": "GAME PROP", "player_props": "PLAYER PROP", "futu
 
 
 def build_discord_payload(result: dict) -> dict:
-    summary = result.get("summary", "No bets on today's slate.")
+    summary = result.get("summary", "No bets this run.")
     watchlist = result.get("watchlist", [])
     tr = result.get("_track_record", {})
     n_eval = result.get("markets_evaluated")
     scanned = f" · {n_eval} markets" if n_eval else ""
     tr_note = f" · {tr.get('note')}" if tr.get("note") else ""
+    slot = result.get("_run_slot") or run_slot_label()
 
     picks = flatten_picks(result)
     if not picks:
         return {
             "username": "Moby",
             "embeds": [{
-                "title": "No bets on today's slate",
-                "description": summary[:4096],
+                "title": f"🐋 Moby — {slot} run · no bets",
+                "description": _clean(summary, 400),
                 "color": 0x95A5A6,
                 "fields": [{"name": "Watchlist", "value": _fmt_list(watchlist), "inline": False}],
                 "footer": {"text": f"Moby · multi-factor sentiment{scanned}{tr_note}"},
@@ -818,7 +895,7 @@ def build_discord_payload(result: dict) -> dict:
     )
     embeds = [{
         "username": "Moby",
-        "title": "🐋 Moby — Today's slate",
+        "title": f"🐋 Moby — {slot} run",
         "description": f"{_clean(summary, 280)}\n\n**{header_lines}**",
         "color": 0x3498DB,
         "footer": {"text": f"Match-level first · futures = glance{scanned}{tr_note}"},
@@ -917,8 +994,11 @@ def main() -> int:
     model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     dry_run = os.environ.get("DRY_RUN") == "1"
 
-    now = datetime.now(timezone.utc).isoformat()
-    print(f"[{now}] Moby run | tag={tag} model={model}")
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    slot = run_slot_label(now_dt)
+    window_hours = float(os.environ.get("WINDOW_HOURS", "12"))
+    print(f"[{now}] Moby run | slot={slot} tag={tag} model={model}")
 
     events = fetch_events(tag)
     markets = clean_markets(events, min_liquidity, max_spread)
@@ -942,10 +1022,26 @@ def main() -> int:
     print("Track record:", track_record.get("note", ""))
     print("X sentiment:", x_sentiment.get("note", ""))
 
+    run_context = {
+        "now_utc": now,
+        "run_label": f"{slot} CT",
+        "window_hours": window_hours,
+        "note": ("Prioritize games kicking off after now_utc, soonest first. "
+                 "Skip games already late/most-of-the-way through."),
+    }
+
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    result = run_analysis(client, model, markets, track_record, x_sentiment)
+    result = run_analysis(client, model, markets, track_record, x_sentiment, run_context)
     result["markets_evaluated"] = len(markets)
     result["_track_record"] = track_record
+    result["_run_slot"] = slot
+
+    # Hard backstop: drop zero/low-upside picks (e.g. a 100¢ lock) the model
+    # shouldn't have surfaced, regardless of how it labeled them.
+    max_price = float(os.environ.get("MAX_PICK_PRICE", "0.90"))
+    pruned = prune_low_upside(result, max_price=max_price)
+    if pruned:
+        print(f"Pruned {pruned} low/zero-upside pick(s) priced >= {max_price} or <= 0.05.")
 
     print("Summary:", result.get("summary", ""))
     print("Watchlist:", result.get("watchlist", []))
